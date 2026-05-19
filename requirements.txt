@@ -1,0 +1,5 @@
+ddddocr
+requests
+pillow
+pycryptodome
+beautifulsoup4
