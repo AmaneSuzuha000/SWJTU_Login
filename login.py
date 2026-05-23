@@ -122,6 +122,46 @@ def derive_origin(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def prefer_https_origin(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return ""
+    return f"https://{parsed.netloc}"
+
+
+def build_origin_candidates(url: str) -> list[str]:
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return []
+
+    candidates: list[str] = []
+    for item in (
+        prefer_https_origin(url),
+        derive_origin(url),
+        f"http://{parsed.netloc}",
+    ):
+        if item and item not in candidates:
+            candidates.append(item)
+    return candidates
+
+
+def warmup_requests_jwc_session(
+    session: requests.Session,
+    jwc_base: str,
+    timeout: int = 10,
+) -> None:
+    for base in build_origin_candidates(jwc_base):
+        for url in (
+            f"{base.rstrip('/')}/vatuu/UserLoginForCAS",
+            f"{base.rstrip('/')}/vatuu/UserLoadingAction",
+            f"{base.rstrip('/')}/vatuu/UserFramework",
+        ):
+            try:
+                session.get(url, allow_redirects=True, timeout=timeout)
+            except Exception:
+                continue
+
+
 def build_requests_session(
     auth_state: AuthState,
     extra_headers: dict[str, str] | None = None,
@@ -149,17 +189,36 @@ def is_requests_session_ready(
     jwc_base: str,
     timeout: int = 10,
 ) -> bool:
-    resp = session.get(
-        f"{jwc_base}/vatuu/UserLoadingAction",
-        allow_redirects=False,
-        timeout=timeout,
-    )
-    location = resp.headers.get("Location") or resp.headers.get("location", "")
+    warmup_requests_jwc_session(session, jwc_base, timeout=timeout)
 
-    if resp.status_code == 302 and "cas.swjtu.edu.cn" in location:
-        return False
+    for base in build_origin_candidates(jwc_base):
+        try:
+            resp = session.get(
+                f"{base.rstrip('/')}/vatuu/UserFramework",
+                allow_redirects=True,
+                timeout=timeout,
+            )
+        except Exception:
+            continue
 
-    return True
+        if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding or "utf-8"
+
+        final_url = resp.url
+        html_text = resp.text
+
+        if "cas.swjtu.edu.cn" in final_url or "/authserver/login" in final_url:
+            continue
+        if "/service/login.html" in final_url:
+            continue
+        if "跳转统一账号登陆" in html_text:
+            continue
+        if "本页面需要登录系统后才能使用" in html_text:
+            continue
+
+        return True
+
+    return False
 
 
 class PlaywrightLoginProvider:
@@ -441,15 +500,31 @@ class PlaywrightLoginProvider:
                 print(f"MFA 页面提示：{message}")
 
     def _finalize_authenticated_navigation(self, page: Any) -> None:
-        try:
-            page.goto(self.service_url, wait_until="domcontentloaded")
-        except Exception:
-            pass
+        candidates = [
+            self.service_url,
+            self.service_url.replace("http://", "https://"),
+            f"{prefer_https_origin(self.service_url)}/vatuu/UserFramework",
+            f"{prefer_https_origin(self.service_url)}/vatuu/UserLoadingAction",
+        ]
 
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
+        seen: set[str] = set()
+        for url in candidates:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+
+            try:
+                page.goto(url, wait_until="domcontentloaded")
+            except Exception:
+                continue
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+
+            if "cas.swjtu.edu.cn" not in page.url and "/service/login.html" not in page.url:
+                break
 
     def _accept_trust_device_modal(self, page: Any) -> bool:
         for _ in range(10):
@@ -613,20 +688,21 @@ class PlaywrightLoginProvider:
         self._finalize_authenticated_navigation(page)
         print(f"导出前浏览器最终 URL：{page.url}")
 
-    def export_auth_state(self, context: Any) -> AuthState:
-        cookies = context.cookies(
-            [
-                self.cas_base,
-                self.jwc_base,
-                self.service_url,
-            ]
-        )
+    def export_auth_state(self, context: Any, page: Any | None = None) -> AuthState:
+        cookies = context.cookies()
+        effective_service_url = self.service_url.replace("http://", "https://")
+        effective_jwc_base = prefer_https_origin(self.service_url) or self.jwc_base
+
+        if page is not None and "jwc.swjtu.edu.cn" in page.url:
+            effective_service_url = page.url
+            effective_jwc_base = prefer_https_origin(page.url) or effective_jwc_base
+
         return AuthState(
             cookies=cookies,
             user_agent=self.user_agent,
             cas_base=self.cas_base,
-            jwc_base=self.jwc_base,
-            service_url=self.service_url,
+            jwc_base=effective_jwc_base,
+            service_url=effective_service_url,
         )
 
     def login(self) -> AuthState:
@@ -681,7 +757,7 @@ class PlaywrightLoginProvider:
                     print("浏览器当前仍停留在 CAS 登录页。")
                     print("导出的 requests.Session 可能尚未完成认证。")
 
-                auth_state = self.export_auth_state(context)
+                auth_state = self.export_auth_state(context, page)
                 print(f"浏览器最终 URL：{page.url}")
                 print(f"已为 requests.Session 导出 {len(auth_state.cookies)} 个 Cookie。")
                 return auth_state
@@ -715,7 +791,7 @@ class SWJTUAssessor:
         self.auth_state: AuthState | None = None
         self.session: requests.Session | None = None
 
-    def login(self, save_auth_state: bool = False) -> bool:
+    def login(self, save_auth_state: bool = True) -> bool:
         self.auth_state, self.session = self.provider.login_and_build_session()
 
         if save_auth_state and self.auth_state:
@@ -751,7 +827,7 @@ def login_and_get_session(
     *,
     headless: bool = False,
     account_root: str | Path | None = None,
-    save_auth_state: bool = False,
+    save_auth_state: bool = True,
 ) -> requests.Session:
     client = SWJTUAssessor(
         username=username,
@@ -772,5 +848,5 @@ if __name__ == "__main__":
         password="Password",
         headless=False,
     )
-    success = client.login(save_auth_state=False)
+    success = client.login(save_auth_state=True)
     print("登录结果：", success)
