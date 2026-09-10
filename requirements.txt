@@ -4,3 +4,5 @@ pillow
 pycryptodome
 beautifulsoup4
 playwright
+# YHXT(yethan) SM2 _j encryption (pure Python, no Node.js needed)
+gmssl==3.2.2

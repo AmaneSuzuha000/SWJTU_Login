@@ -5,7 +5,7 @@ import json
 import os
 import time
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
@@ -22,6 +22,12 @@ SERVICE_URL = (
     "http://jwc.swjtu.edu.cn/"
     "vatuu/UserLoginForWiseduAction"
 )
+# 2026 年选课走的新系统（yethan）。CAS 的 service 决定回跳目标，
+# 只有回跳 yethan 服务端才签发 ytoken(JWT) cookie。
+YHXT_SERVICE_URL = "https://yhxt.swjtu.edu.cn/yethan/public/cas/tms"
+YHXT_HOST = "yhxt.swjtu.edu.cn"
+YHXT_API_BASE = "https://yhxt.swjtu.edu.cn/yethan"
+YHXT_PROBE_URL = f"{YHXT_API_BASE}/common/test-arrange"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -102,6 +108,18 @@ class AuthState:
     jwc_base: str
     service_url: str
     created_at: float = field(default_factory=time.time)
+    # 新系统认证产物。默认值保证旧 auth_state.json 仍可加载（load 用 cls(**data)）。
+    ytoken: str = ""
+    target: str = "jwc"
+
+    @property
+    def effective_ytoken(self) -> str:
+        """ytoken 字段缺失时（旧版本缓存）从 cookie 里派生。
+
+        早期导出的 auth_state.json 没有 ytoken 字段，但 cookie 里确实有，
+        只看字段会把已登录的会话误判成未登录。
+        """
+        return self.ytoken or extract_ytoken(self.cookies)
 
     def save(self, path: str | Path) -> None:
         target = Path(path)
@@ -114,7 +132,45 @@ class AuthState:
     @classmethod
     def load(cls, path: str | Path) -> "AuthState":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(**data)
+        # 忽略旧文件里不存在/未来新增的键，避免 load 直接抛 TypeError
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def extract_ytoken(cookies: list[dict[str, Any]]) -> str:
+    """从 cookie 列表里取 ytoken(JWT)。
+
+    主仓踩过的坑：判定登录成功**只凭 URL 不含 user-login 是不够的**——
+    设备信任页、CAS ticket 回跳中间态也在主域下，那时 ytoken 尚未写入。
+    必须以 ytoken cookie 真实出现为唯一凭据。
+    """
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        if cookie.get("name") == "ytoken" and cookie.get("value"):
+            return str(cookie["value"])
+    return ""
+
+
+def yhxt_session_ready(session: requests.Session, timeout: int = 10) -> bool:
+    """用一次真实调用验证 ytoken 是否被服务端接受。
+
+    `common/test-arrange` 是只读探测端点，未认证时返回登录失效，
+    比猜 cookie 有效期可靠。
+    """
+    headers = {"ytoken": session.headers.get("ytoken", "")}
+    if not headers["ytoken"]:
+        return False
+    try:
+        resp = session.get(YHXT_PROBE_URL, headers=headers, timeout=timeout, allow_redirects=True)
+    except Exception:
+        return False
+    text = (resp.text or "")[:2048].lower()
+    if resp.status_code in (401, 403):
+        return False
+    if any(m in text for m in ("登录", "login", "authserver", "统一身份认证")):
+        return False
+    return resp.status_code < 400
 
 
 def derive_origin(url: str) -> str:
@@ -169,6 +225,26 @@ def build_requests_session(
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
     session.headers["User-Agent"] = auth_state.user_agent
+
+    # 抢课是高并发短连接：默认连接池（10）会在预热阶段就把连接建爆，
+    # 与主仓一致放大到 32。
+    from requests.adapters import HTTPAdapter
+
+    adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, pool_block=False)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    if auth_state.target == "yhxt":
+        # YHXT 的鉴权头是 ytoken，且必须与 Origin/Referer 同源，
+        # 否则会被同域校验打回登录页（光有 cookie 不够）。
+        session.headers.update({
+            "Accept": "application/json, text/plain, */*",
+            "Origin": f"https://{YHXT_HOST}",
+            "Referer": f"https://{YHXT_HOST}/",
+        })
+        token = auth_state.effective_ytoken
+        if token:
+            session.headers["ytoken"] = token
 
     if extra_headers:
         session.headers.update(extra_headers)
@@ -228,22 +304,38 @@ class PlaywrightLoginProvider:
         password: str,
         *,
         cas_base: str = CAS_BASE,
-        service_url: str = SERVICE_URL,
+        service_url: str | None = None,
         user_agent: str = USER_AGENT,
         headless: bool = False,
         account_root: str | Path | None = None,
+        target: str = "jwc",
     ) -> None:
+        """target="jwc" 老教务 vatuu；target="yhxt" 新系统并产出 ytoken。
+
+        service_url 显式给出时以它为准（便于接其它子系统），
+        否则由 target 推导——这一步决定 CAS 回跳去哪，也就决定
+        能否拿到 ytoken。
+        """
+        if target not in ("jwc", "yhxt"):
+            raise ValueError("target 只能是 'jwc' 或 'yhxt'")
+
         self.username = username
         self.password = password
+        self.target = target
         self.cas_base = cas_base.rstrip("/")
+        if service_url is None:
+            service_url = YHXT_SERVICE_URL if target == "yhxt" else SERVICE_URL
         self.service_url = service_url
         self.jwc_base = derive_origin(service_url)
         self.user_agent = user_agent
         self.headless = headless
 
         base_dir = Path(account_root or Path(__file__).resolve().parent / "account")
+        # 认证状态按目标系统分开缓存：jwc 会话有效 ≠ ytoken 有效，
+        # 共用一个文件会让恢复逻辑误判成"仍可用"。
         self.account_dir = base_dir / username
         self.user_data_dir = self.account_dir / "playwright_profile"
+        self.auth_state_name = f"auth_state-{target}.json"
         self.account_dir.mkdir(parents=True, exist_ok=True)
 
     def _require_playwright(self) -> None:
@@ -500,12 +592,19 @@ class PlaywrightLoginProvider:
                 print(f"MFA 页面提示：{message}")
 
     def _finalize_authenticated_navigation(self, page: Any) -> None:
-        candidates = [
-            self.service_url,
-            self.service_url.replace("http://", "https://"),
-            f"{prefer_https_origin(self.service_url)}/vatuu/UserFramework",
-            f"{prefer_https_origin(self.service_url)}/vatuu/UserLoadingAction",
-        ]
+        if self.target == "yhxt":
+            # 新系统没有 /vatuu/* 那套端点，回访 service 让服务端写 ytoken 即可
+            candidates = [
+                self.service_url,
+                f"{YHXT_API_BASE}/study/",
+            ]
+        else:
+            candidates = [
+                self.service_url,
+                self.service_url.replace("http://", "https://"),
+                f"{prefer_https_origin(self.service_url)}/vatuu/UserFramework",
+                f"{prefer_https_origin(self.service_url)}/vatuu/UserLoadingAction",
+            ]
 
         seen: set[str] = set()
         for url in candidates:
@@ -523,7 +622,12 @@ class PlaywrightLoginProvider:
             except Exception:
                 pass
 
-            if "cas.swjtu.edu.cn" not in page.url and "/service/login.html" not in page.url:
+            current = page.url or ""
+            if self.target == "yhxt":
+                if YHXT_HOST in current and "/authserver/login" not in current:
+                    break
+                continue
+            if "cas.swjtu.edu.cn" not in current and "/service/login.html" not in current:
                 break
 
     def _accept_trust_device_modal(self, page: Any) -> bool:
@@ -688,6 +792,10 @@ class PlaywrightLoginProvider:
         self._finalize_authenticated_navigation(page)
         print(f"导出前浏览器最终 URL：{page.url}")
 
+    def _authenticated(self, cookies: list[dict[str, Any]]) -> bool:
+        """是否已拿到 YHXT 认证产物 ytoken。"""
+        return bool(extract_ytoken(cookies))
+
     def export_auth_state(self, context: Any, page: Any | None = None) -> AuthState:
         cookies = context.cookies()
         effective_service_url = self.service_url.replace("http://", "https://")
@@ -703,6 +811,8 @@ class PlaywrightLoginProvider:
             cas_base=self.cas_base,
             jwc_base=effective_jwc_base,
             service_url=effective_service_url,
+            ytoken=extract_ytoken(cookies),
+            target=self.target,
         )
 
     def login(self) -> AuthState:
@@ -753,6 +863,16 @@ class PlaywrightLoginProvider:
                     )
                     self._finalize_authenticated_navigation(page)
 
+                if self.target == "yhxt":
+                    # ytoken 是回跳 yethan 之后才由服务端写入 cookie 的；
+                    # 只看到"离开了 CAS 登录页"不代表拿到了它（设备信任页、
+                    # ticket 回跳中间态同样在主域下）。必须等它真实出现。
+                    waited = self._wait_for_ytoken(context, page)
+                    if not waited:
+                        print("等待 ytoken 超时：请在浏览器里确认已完成登录/验证。")
+                        self._wait_for_manual_steps(page)
+                        self._wait_for_ytoken(context, page)
+
                 if "/authserver/login" in page.url:
                     print("浏览器当前仍停留在 CAS 登录页。")
                     print("导出的 requests.Session 可能尚未完成认证。")
@@ -760,9 +880,35 @@ class PlaywrightLoginProvider:
                 auth_state = self.export_auth_state(context, page)
                 print(f"浏览器最终 URL：{page.url}")
                 print(f"已为 requests.Session 导出 {len(auth_state.cookies)} 个 Cookie。")
+                if self.target == "yhxt":
+                    token = auth_state.effective_ytoken
+                    if token:
+                        print(f"ytoken 已取得（len={len(token)}）")
+                    else:
+                        print("警告：未取得 ytoken，yhxt 接口将无法调用。")
                 return auth_state
             finally:
                 context.close()
+
+    def _wait_for_ytoken(self, context: Any, page: Any, timeout_s: float = 60.0) -> bool:
+        """轮询等待 ytoken cookie 出现，必要时主动回访 service。"""
+        deadline = time.time() + timeout_s
+        revisited = False
+        while time.time() < deadline:
+            if extract_ytoken(context.cookies()):
+                return True
+
+            # 已离开 CAS 却拿不到 ytoken：多半是回跳没走完，主动回访一次
+            if not revisited and "/authserver/login" not in (page.url or ""):
+                revisited = True
+                try:
+                    page.goto(self.service_url, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(500)
+        return False
 
     def login_and_build_session(self) -> tuple[AuthState, requests.Session]:
         auth_state = self.login()
@@ -778,18 +924,33 @@ class SWJTUAssessor:
         *,
         headless: bool = False,
         account_root: str | Path | None = None,
+        target: str = "jwc",
     ) -> None:
+        """target="yhxt" 时登录产物含 ytoken，可直接拿 sport/course 客户端。"""
         self.username = username
         self.password = password
+        self.target = target
         self.provider = PlaywrightLoginProvider(
             username=username,
             password=password,
             headless=headless,
             account_root=account_root,
+            target=target,
         )
-        self.auth_state_path = self.provider.account_dir / "auth_state.json"
+        self.auth_state_path = self.provider.account_dir / self.provider.auth_state_name
         self.auth_state: AuthState | None = None
         self.session: requests.Session | None = None
+
+    def _ready(self) -> bool:
+        """按目标系统判会话可用性——两条通道探测端点完全不同。"""
+        if self.auth_state is None or self.session is None:
+            return False
+        if self.target == "yhxt":
+            if not self.auth_state.effective_ytoken:
+                print("未取得 ytoken，无法调用 yhxt 接口")
+                return False
+            return yhxt_session_ready(self.session)
+        return is_requests_session_ready(self.session, self.auth_state.jwc_base)
 
     def login(self, save_auth_state: bool = True) -> bool:
         self.auth_state, self.session = self.provider.login_and_build_session()
@@ -798,15 +959,35 @@ class SWJTUAssessor:
             self.auth_state.save(self.auth_state_path)
             print(f"认证状态已保存到：{self.auth_state_path}")
 
-        ready = is_requests_session_ready(self.session, self.auth_state.jwc_base)
+        ready = self._ready()
         print(f"requests.Session 是否可用：{ready}")
         return ready
 
     def restore_session(self, path: str | Path | None = None) -> bool:
         target = Path(path or self.auth_state_path)
+        if not target.exists():
+            # 兼容改名前的旧缓存（auth_state.json）：老用户升级后
+            # 默认路径变化会让恢复直接失败，这里回退一次。
+            legacy = target.parent / "auth_state.json"
+            if path is None and legacy.exists():
+                print(f"未找到 {target.name}，回退旧缓存 {legacy.name}")
+                target = legacy
+            else:
+                print(f"认证状态文件不存在：{target}")
+                return False
         self.auth_state = AuthState.load(target)
+        # 会话真实类型以缓存记录为准；但旧缓存没写 target 时必须尊重调用方
+        # 显式传入的 target，否则会把想恢复的 yhxt 会话当成 jwc 处理。
+        recorded = None
+        try:
+            recorded = json.loads(target.read_text(encoding="utf-8")).get("target")
+        except Exception:
+            recorded = None
+        if recorded in ("jwc", "yhxt"):
+            self.target = recorded
+        self.auth_state.target = self.target
         self.session = build_requests_session(self.auth_state)
-        ready = is_requests_session_ready(self.session, self.auth_state.jwc_base)
+        ready = self._ready()
         print(f"requests.Session 恢复结果：{ready}")
         return ready
 
@@ -820,6 +1001,30 @@ class SWJTUAssessor:
             raise RuntimeError("当前没有可用的认证状态，请先调用 login()。")
         return self.auth_state
 
+    def extract_ytoken(self) -> tuple[str, list[dict[str, Any]]]:
+        """返回 (ytoken, cookies)，喂给 yhxt 客户端。"""
+        state = self.export_auth_state()
+        return state.ytoken or extract_ytoken(state.cookies), list(state.cookies)
+
+    def _yhxt_client(self, cls):
+        state = self.export_auth_state()
+        token = state.ytoken or extract_ytoken(state.cookies)
+        if not token:
+            raise RuntimeError("未取得 ytoken，无法构造 YHXT 客户端")
+        return cls(token, session=self.get_session(), cookies=state.cookies)
+
+    def sport_client(self):
+        """体育选课客户端（复用已认证 session）。"""
+        from yhxt import SportClient
+
+        return self._yhxt_client(SportClient)
+
+    def course_client(self):
+        """普通课程客户端（复用已认证 session）。"""
+        from yhxt import CourseClient
+
+        return self._yhxt_client(CourseClient)
+
 
 def login_and_get_session(
     username: str,
@@ -828,12 +1033,14 @@ def login_and_get_session(
     headless: bool = False,
     account_root: str | Path | None = None,
     save_auth_state: bool = True,
+    target: str = "jwc",
 ) -> requests.Session:
     client = SWJTUAssessor(
         username=username,
         password=password,
         headless=headless,
         account_root=account_root,
+        target=target,
     )
     success = client.login(save_auth_state=save_auth_state)
     if not success:
@@ -843,10 +1050,34 @@ def login_and_get_session(
 
 if __name__ == "__main__":
 
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SWJTU 真浏览器登录器")
+    parser.add_argument("username", nargs="?", default="",
+                        help="学号（留空则读环境变量 SWJTU_USERNAME）")
+    parser.add_argument("password", nargs="?", default="",
+                        help="密码（留空则读环境变量 SWJTU_PASSWORD，再退回交互输入）")
+    parser.add_argument("--target", choices=("jwc", "yhxt"), default="jwc",
+                        help="jwc=老教务 vatuu；yhxt=新系统 yethan（产出 ytoken）")
+    parser.add_argument("--headless", action="store_true", help="无头模式运行浏览器")
+    args = parser.parse_args()
+
+    username = args.username or os.environ.get("SWJTU_USERNAME", "")
+    password = args.password or os.environ.get("SWJTU_PASSWORD", "") or getpass.getpass("密码：")
+
+    if not username:
+        parser.error("需要学号（位置参数或环境变量 SWJTU_USERNAME）")
+
     client = SWJTUAssessor(
-        username="Username",
-        password="Password",
-        headless=False,
+        username=username,
+        password=password,
+        headless=args.headless,
+        target=args.target,
     )
     success = client.login(save_auth_state=True)
     print("登录结果：", success)
+
+    if success and args.target == "yhxt":
+        token, cookies = client.extract_ytoken()
+        print(f"ytoken：{(token[:24] + '...') if token else '(空)'}")
+        print(f"cookie 数：{len(cookies)}")

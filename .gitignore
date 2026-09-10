@@ -1,0 +1,21 @@
+# 运行期生成的真实会话与凭据缓存 —— 绝不能提交
+account/
+*.pkl
+cookies*.pkl
+yhxt_auth.json
+auth_state.json
+
+# OCR / 验证码临时件
+captcha.jpg
+captcha*.png
+code.jpg
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地 IDE
+.idea/
+.vscode/
