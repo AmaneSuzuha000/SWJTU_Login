@@ -28,6 +28,14 @@ SERVICE_URL = ("http://jwc.swjtu.edu.cn/"
                "vatuu/UserLoginForWiseduAction"
                )
 
+# 2026 年选课实际使用的新系统（yethan）。CAS 回跳该 service 后，
+# ytoken(JWT) 由服务端写入 .swjtu.edu.cn 域 cookie —— 见 yhxt.py。
+YHXT_SERVICE_URL = "https://yhxt.swjtu.edu.cn/yethan/public/cas/tms"
+
+YHXT_HOST = "yhxt.swjtu.edu.cn"
+
+YHXT_API_BASE = "https://yhxt.swjtu.edu.cn/yethan"
+
 AES_CHARS = (
     "ABCDEFGHJKMNPQRSTWXYZ"
     "abcdefhijkmnprstwxyz2345678"
@@ -36,8 +44,12 @@ AES_CHARS = (
 
 class SWJTUAssessor:
 
-    def __init__(self, username, password):
+    def __init__(self, username, password, target="jwc"):
+        """target="jwc" 走老教务 vatuu；target="yhxt" 走新系统并产出 ytoken。"""
+        if target not in ("jwc", "yhxt"):
+            raise ValueError("target 只能是 'jwc' 或 'yhxt'")
 
+        self.target = target
         self.username = username
         self.password = password
 
@@ -60,9 +72,11 @@ class SWJTUAssessor:
             exist_ok=True
         )
 
+        # 按目标系统分开缓存：jwc 与 yhxt 的会话有效性互不等价，
+        # 共用一个 cookies.pkl 会让恢复逻辑误判。
         self.cookie_file = os.path.join(
             self.user_dir,
-            "cookies.pkl"
+            "cookies-%s.pkl" % self.target
         )
 
         self.config_file = os.path.join(
@@ -151,11 +165,16 @@ class SWJTUAssessor:
                 raise RuntimeError(f"教务系统完全无法访问: {e2}") from e2
 
         self.SERVICE_URL = f"{self.JWC_BASE}/vatuu/UserLoginForWiseduAction"
+        if self.target == "yhxt":
+            # 关键：CAS 的 service 决定回跳到哪个系统，只有回跳 yethan
+            # 才会由服务端签发 ytoken cookie。
+            self.SERVICE_URL = YHXT_SERVICE_URL
 
         print(f"\n{'=' * 60}")
         print("✅ 西南交大登录器初始化完成")
         print(f"CAS_BASE = {self.CAS_BASE}")
         print(f"SERVICE_URL = {self.SERVICE_URL}")
+        print(f"目标系统 = {self.target}")
         print(f"用户名: {self.username}")
 
 
@@ -413,18 +432,29 @@ class SWJTUAssessor:
 
             print("正在尝试使用历史登录状态...")
 
-            test = self.session.get(
-                f"{self.JWC_BASE}/vatuu/UserLoadingAction",
-                allow_redirects=False
-            )
+            if self.target == "yhxt":
+                # 只认 ytoken 本身（extract_ytoken 返回元组，恒为真值，不能用）。
+                # ytoken 由 CAS 回跳写入，pickle 恢复后仍在 jar 里。
+                if self.ytoken():
+                    print("历史 ytoken 仍有效，无需重新登录")
+                    return True
+                # 无 ytoken：不去探测 JWC（与 yhxt 会话无关），
+                # 直接落到函数后面的完整 CAS 登录流程。
+                print("历史会话里没有 ytoken，走完整登录")
 
-            # 未跳转 CAS
-            if test.status_code != 302:
-                print("历史 Cookie 仍有效，无需 MFA")
+            else:
+                test = self.session.get(
+                    f"{self.JWC_BASE}/vatuu/UserLoadingAction",
+                    allow_redirects=False
+                )
 
-                return True
+                # 未跳转 CAS
+                if test.status_code != 302:
+                    print("历史 Cookie 仍有效，无需 MFA")
 
-            print("Cookie 已失效，需要重新登录")
+                    return True
+
+                print("Cookie 已失效，需要重新登录")
 
         execution, lt, salt = (
             self.get_login_page()
@@ -542,6 +572,10 @@ class SWJTUAssessor:
 
     def finish_jwc_login(self):
 
+        if self.target == "yhxt":
+            self.finish_yhxt_login()
+            return
+
         print("正在建立教务系统 Session...")
 
         self.session.get(
@@ -557,6 +591,104 @@ class SWJTUAssessor:
         print("教务系统登录完成")
 
         self.save_cookies()
+
+    # ── YHXT (yethan) 通道：产出 ytoken ────────────────────────
+
+    def finish_yhxt_login(self):
+
+        print("正在建立 YHXT(yethan) 会话...")
+
+        # service=.../public/cas/tms 的回跳已在 login() 里跟随过；
+        # 这里兜底再走一次，覆盖 reauth 分支只建立 jwc 会话的情况。
+        if not self.ytoken():
+            try:
+                self.session.get(
+                    YHXT_SERVICE_URL,
+                    allow_redirects=True,
+                    timeout=10,
+                )
+            except requests.RequestException as exc:
+                print("YHXT 兜底跳转失败:", exc)
+
+        token = self.ytoken()
+        if token:
+            print(f"YHXT 登录完成（ytoken len={len(token)}）")
+        else:
+            print("警告：未取得 ytoken，yhxt 接口将无法调用")
+
+        self.save_cookies()
+
+    def ytoken(self):
+
+        """从会话 cookie 里取 ytoken(JWT)。
+
+        服务端在 CAS 回跳 /public/cas/tms 成功后，把 ytoken 写到
+        .swjtu.edu.cn 域；只认 cookie，不要试图从 HTML/localStorage 猜。
+        """
+        jar = getattr(self.session, "cookies", None)
+        if jar is None:
+            return ""
+        for morsel in jar:
+            if getattr(morsel, "name", None) == "ytoken":
+                value = getattr(morsel, "value", "") or ""
+                if value:
+                    return value
+        # 部分 requests 版本迭代的是 cookie domain key，退化到 get()
+        try:
+            return jar.get("ytoken", "") or ""
+        except Exception:
+            return ""
+
+    def yhxt_cookies(self):
+
+        """导出 yhxt 需要的 cookie（同域校验缺 cookie 会被打回登录页）。"""
+        out = []
+        for morsel in getattr(self.session, "cookies", []):
+            name = getattr(morsel, "name", None)
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "value": getattr(morsel, "value", ""),
+                "domain": getattr(morsel, "domain", YHXT_HOST) or YHXT_HOST,
+                "path": getattr(morsel, "path", "/") or "/",
+            })
+        return out
+
+    def extract_ytoken(self):
+
+        """便捷出口：返回 (ytoken, cookies) 供 yhxt.SportClient 使用。"""
+        return self.ytoken(), self.yhxt_cookies()
+
+    def sport_client(self):
+
+        """用当前已登录会话直接构造体育选课客户端。"""
+        from yhxt import SportClient
+
+        token = self.ytoken()
+        if not token:
+            raise RuntimeError("未取得 ytoken，无法构造 SportClient")
+        return SportClient(
+            token,
+            session=self.session,
+            base=YHXT_API_BASE,
+            cookies=self.yhxt_cookies(),
+        )
+
+    def course_client(self):
+
+        """用当前已登录会话构造普通课程客户端。"""
+        from yhxt import CourseClient
+
+        token = self.ytoken()
+        if not token:
+            raise RuntimeError("未取得 ytoken，无法构造 CourseClient")
+        return CourseClient(
+            token,
+            session=self.session,
+            base=YHXT_API_BASE,
+            cookies=self.yhxt_cookies(),
+        )
 
     def save_cookies(self):
 
@@ -590,15 +722,35 @@ class SWJTUAssessor:
 
 if __name__ == "__main__":
 
-    username = ("Username")
+    import argparse
 
-    password = "Password"
+    parser = argparse.ArgumentParser(description="SWJTU CAS 登录器")
+    parser.add_argument("username", nargs="?", default="",
+                        help="学号（留空则读环境变量 SWJTU_USERNAME）")
+    parser.add_argument("password", nargs="?", default="",
+                        help="密码（留空则读环境变量 SWJTU_PASSWORD）")
+    parser.add_argument("--target", choices=("jwc", "yhxt"), default="jwc",
+                        help="jwc=老教务 vatuu；yhxt=新系统 yethan（产出 ytoken）")
+    args = parser.parse_args()
+
+    username = args.username or os.environ.get("SWJTU_USERNAME", "")
+
+    password = args.password or os.environ.get("SWJTU_PASSWORD", "")
+
+    if not username or not password:
+        parser.error("需要学号与密码（位置参数或环境变量 SWJTU_USERNAME / SWJTU_PASSWORD）")
 
     client = SWJTUAssessor(
         username,
-        password
+        password,
+        target=args.target
     )
 
     success = client.login()
 
     print("登录结果:", success)
+
+    if success and args.target == "yhxt":
+        token, cookies = client.extract_ytoken()
+        print("ytoken:", (token[:24] + "...") if token else "(空)")
+        print("cookie 数:", len(cookies))
